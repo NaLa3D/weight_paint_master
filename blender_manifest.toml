@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "weight_paint_master"
-version = "1.3.3"
+version = "1.4.0"
 name = "Weight Paint Master (Pie & Auto Tools)"
 tagline = "Scroll weight blur, bone filter list, overlay/armature toggles, and quick mode/pose tools for Blender 5.2+"
 maintainer = "RieKawata"

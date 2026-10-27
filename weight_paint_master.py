@@ -13,10 +13,10 @@ Weight Paint Master - Blender 5.2+ 対応ウェイトペイント効率化アド
 bl_info = {
     "name": "Weight Paint Master (Pie & Auto Tools)",
     "author": "Antigravity",
-    "version": (1, 3, 3),
+    "version": (1, 4, 0),
     "blender": (5, 0, 0),
     "location": "Weight Paint / Edit / Pose Mode > Shortcut (Alt+W / Shift+W) & View3D > Sidebar > Weight Master",
-    "description": "ホイール対話ウェイトぼかし・ボーン双方向同期リスト・等高線/ペイントワイヤー/アーマチュア表示切替・ポーズ移動＆全クリア統合アドオン",
+    "description": "編集モードXミラー対称ウェイト・ホイール対話ぼかし・ボーン双方向同期・表示切替・ポーズ移動＆全クリア統合アドオン",
     "category": "Paint",
 }
 
@@ -24,6 +24,8 @@ from collections import deque
 import bpy
 import bmesh
 import blf
+from mathutils import Vector
+from mathutils.kdtree import KDTree
 from bpy.types import Operator, Menu, Panel, UIList, AddonPreferences, PropertyGroup
 from bpy.props import (
     FloatProperty,
@@ -341,6 +343,86 @@ def ensure_edit_mode_weight_overlay(context, enable=True):
             space.overlay.show_weight = enable
 
 
+def get_bone_x_sign(obj, vg_name: str) -> int:
+    """
+    指定ボーンがローカルX軸のどちら側にあるか (+1: +X側, -1: -X側, 0: 中央) を判定する。
+    アーマチュア内の実ボーン座標を優先し、なければ名前(.L/.R)から判定する。
+    """
+    if not vg_name:
+        return 0
+    arm_obj = get_related_armature(obj)
+    if arm_obj and arm_obj.data and vg_name in arm_obj.data.bones:
+        bone = arm_obj.data.bones[vg_name]
+        mid_x = 0.5 * (bone.head_local.x + bone.tail_local.x)
+        if abs(mid_x) > 1e-4:
+            return 1 if mid_x > 0.0 else -1
+    side = get_side_category(vg_name)
+    if side == 'LEFT':
+        return 1
+    if side == 'RIGHT':
+        return -1
+    return 0
+
+
+def ensure_opposite_vertex_groups(obj) -> dict[int, int]:
+    """
+    メッシュ内の全頂点グループについて、左右反対側の頂点グループ（.L <-> .R）が存在しなければ自動作成し、
+    {group_index: opposite_group_index} の辞書を返す（BMeshのdeformレイヤー取得前に呼ぶこと）。
+    """
+    if not obj or obj.type != 'MESH':
+        return {}
+    prev_active = obj.vertex_groups.active_index
+    existing_names = [vg.name for vg in obj.vertex_groups]
+    for name in existing_names:
+        opp = flip_side_name(name)
+        if opp != name and opp not in obj.vertex_groups:
+            obj.vertex_groups.new(name=opp)
+    if 0 <= prev_active < len(obj.vertex_groups):
+        obj.vertex_groups.active_index = prev_active
+
+    opp_map = {}
+    for vg in obj.vertex_groups:
+        opp = flip_side_name(vg.name)
+        opp_vg = obj.vertex_groups.get(opp)
+        opp_map[vg.index] = opp_vg.index if opp_vg else vg.index
+    return opp_map
+
+
+def build_mesh_mirror_map(obj) -> tuple[dict[int, int], list[Vector]]:
+    """
+    メッシュのローカルX軸対称頂点マップ {v_idx: mirror_v_idx} と頂点座標リストをKDTreeで高速構築する。
+    """
+    mesh = obj.data
+    if obj.mode == 'EDIT':
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        coords = [v.co.copy() for v in bm.verts]
+    else:
+        coords = [v.co.copy() for v in mesh.vertices]
+
+    n = len(coords)
+    if n == 0:
+        return {}, []
+
+    kd = KDTree(n)
+    for i, co in enumerate(coords):
+        kd.insert(co, i)
+    kd.balance()
+
+    dim_x = obj.dimensions.x if obj.dimensions.x > 1e-4 else 1.0
+    tol = max(0.05, dim_x * 0.05)
+
+    mirror_map = {}
+    for i, co in enumerate(coords):
+        if abs(co.x) <= 1e-4:
+            mirror_map[i] = i
+        else:
+            _, m_idx, dist = kd.find(Vector((-co.x, co.y, co.z)))
+            if m_idx is not None and dist <= tol and (coords[m_idx].x * co.x) <= 1e-4:
+                mirror_map[i] = m_idx
+    return mirror_map, coords
+
+
 # ============================================================================
 # プロパティグループ
 # ============================================================================
@@ -362,6 +444,11 @@ class WPM_Settings(PropertyGroup):
             ('RIGHT', "右 (.R)", "右側（.R / _R）のボーンのみを表示します"),
         ],
         default='ALL',
+    )
+    use_mirror_x_on_edit: BoolProperty(
+        name="左右対称 (Xミラー) で適用",
+        description="編集モード等で頂点にウェイトを振ったりホイールぼかしを行った際、反対側の対称頂点（.L ↔ .R ボーン自動変換）にも自動で左右対称にウェイトを適用します",
+        default=True,
     )
     auto_normalize_on_edit: BoolProperty(
         name="数値変更時に自動正規化",
@@ -761,7 +848,7 @@ class VIEW3D_MT_wpm_bone_select_menu(Menu):
 # ============================================================================
 
 class WPM_OT_set_vertex_weight(Operator):
-    """選択頂点（または全頂点）のウェイトを指定値に設定、または加減算します（Editモード直接更新対応）"""
+    """選択頂点（または全頂点）のウェイトを指定値に設定、または加減算します（Editモード直接更新＆Xミラー対称対応）"""
     bl_idname = "wpm.set_vertex_weight"
     bl_label = "頂点ウェイト数値設定"
     bl_options = {'REGISTER', 'UNDO'}
@@ -798,20 +885,52 @@ class WPM_OT_set_vertex_weight(Operator):
             return {'CANCELLED'}
         vg = ensure_active_vertex_group(obj)
         vg_idx = vg.index
+        vg_name = vg.name
         mesh = obj.data
         settings = getattr(context.scene, "wpm_settings", None)
-        do_norm = settings and settings.auto_normalize_on_edit and len(obj.vertex_groups) > 1
+        do_mirror = bool(settings and settings.use_mirror_x_on_edit)
+
+        opp_group_map = {}
+        opp_vg_idx = vg_idx
+        is_sided_bone = False
+        mirror_map = {}
+        coords = []
+        bone_x_sign = 0
+
+        if do_mirror:
+            opp_group_map = ensure_opposite_vertex_groups(obj)
+            opp_vg_idx = opp_group_map.get(vg_idx, vg_idx)
+            is_sided_bone = (opp_vg_idx != vg_idx)
+            mirror_map, coords = build_mesh_mirror_map(obj)
+            bone_x_sign = get_bone_x_sign(obj, vg_name)
+
+        do_norm = bool(settings and settings.auto_normalize_on_edit and len(obj.vertex_groups) > 1)
 
         if obj.mode == 'EDIT':
             ensure_edit_mode_weight_overlay(context, True)
             bm = bmesh.from_edit_mesh(mesh)
             bm.verts.ensure_lookup_table()
             deform = bm.verts.layers.deform.verify()
-            target_verts = [v for v in bm.verts if v.select]
-            if not target_verts:
-                target_verts = list(bm.verts)
+            selected_indices = [v.index for v in bm.verts if v.select]
+            if not selected_indices:
+                selected_indices = [v.index for v in bm.verts]
+            selected_set = set(selected_indices)
 
-            for v in target_verts:
+            if do_mirror and is_sided_bone and bone_x_sign != 0:
+                source_indices = []
+                for idx in selected_indices:
+                    m_idx = mirror_map.get(idx)
+                    if m_idx is not None and m_idx != idx and m_idx in selected_set:
+                        if (coords[idx].x * bone_x_sign) < -1e-4:
+                            continue
+                    source_indices.append(idx)
+                if not source_indices:
+                    source_indices = selected_indices
+            else:
+                source_indices = selected_indices
+
+            for v_idx in source_indices:
+                v = bm.verts[v_idx]
                 dv = v[deform]
                 cur_w = dv.get(vg_idx, 0.0)
                 if self.mode == 'SET':
@@ -820,21 +939,54 @@ class WPM_OT_set_vertex_weight(Operator):
                     new_w = max(0.0, min(1.0, cur_w + self.value))
                 else:
                     new_w = max(0.0, min(1.0, cur_w * self.value))
-                dv[vg_idx] = new_w
 
-                if do_norm:
-                    other_keys = [k for k in dv.keys() if k != vg_idx]
-                    if other_keys:
-                        rem = max(0.0, 1.0 - new_w)
-                        other_sum = sum(dv[k] for k in other_keys)
-                        if other_sum > 1e-6:
-                            scale = rem / other_sum
-                            for k in other_keys:
-                                dv[k] = dv[k] * scale
-                        elif rem > 0.0:
-                            share = rem / len(other_keys)
-                            for k in other_keys:
-                                dv[k] = share
+                is_center_vert = do_mirror and (mirror_map.get(v_idx) == v_idx)
+
+                if is_center_vert and is_sided_bone:
+                    if do_norm and (2.0 * new_w >= 1.0):
+                        dv.clear()
+                        dv[vg_idx] = 0.5
+                        dv[opp_vg_idx] = 0.5
+                    else:
+                        dv[vg_idx] = new_w
+                        dv[opp_vg_idx] = new_w
+                        if do_norm:
+                            other_keys = [k for k in dv.keys() if k not in (vg_idx, opp_vg_idx)]
+                            if other_keys:
+                                rem = max(0.0, 1.0 - 2.0 * new_w)
+                                other_sum = sum(dv[k] for k in other_keys)
+                                if other_sum > 1e-6:
+                                    scale = rem / other_sum
+                                    for k in other_keys:
+                                        dv[k] = dv[k] * scale
+                                elif rem > 0.0:
+                                    share = rem / len(other_keys)
+                                    for k in other_keys:
+                                        dv[k] = share
+                else:
+                    dv[vg_idx] = new_w
+                    if do_norm:
+                        other_keys = [k for k in dv.keys() if k != vg_idx]
+                        if other_keys:
+                            rem = max(0.0, 1.0 - new_w)
+                            other_sum = sum(dv[k] for k in other_keys)
+                            if other_sum > 1e-6:
+                                scale = rem / other_sum
+                                for k in other_keys:
+                                    dv[k] = dv[k] * scale
+                            elif rem > 0.0:
+                                share = rem / len(other_keys)
+                                for k in other_keys:
+                                    dv[k] = share
+
+                    if do_mirror:
+                        m_idx = mirror_map.get(v_idx)
+                        if m_idx is not None and m_idx != v_idx:
+                            m_dv = bm.verts[m_idx][deform]
+                            src_items = list(dv.items())
+                            m_dv.clear()
+                            for k, w in src_items:
+                                m_dv[opp_group_map.get(k, k)] = w
 
             bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
         else:
@@ -842,8 +994,23 @@ class WPM_OT_set_vertex_weight(Operator):
             if not indices:
                 self.report({'WARNING'}, "対象の頂点がありません")
                 return {'CANCELLED'}
+            selected_set = set(indices)
 
-            for idx in indices:
+            if do_mirror and is_sided_bone and bone_x_sign != 0:
+                source_indices = []
+                for idx in indices:
+                    m_idx = mirror_map.get(idx)
+                    if m_idx is not None and m_idx != idx and m_idx in selected_set:
+                        if (coords[idx].x * bone_x_sign) < -1e-4:
+                            continue
+                    source_indices.append(idx)
+                if not source_indices:
+                    source_indices = indices
+            else:
+                source_indices = indices
+
+            vgroups = obj.vertex_groups
+            for idx in source_indices:
                 cur_w = 0.0
                 for g in mesh.vertices[idx].groups:
                     if g.group == vg_idx:
@@ -858,6 +1025,10 @@ class WPM_OT_set_vertex_weight(Operator):
                     new_w = max(0.0, min(1.0, cur_w * self.value))
 
                 vg.add([idx], new_w, 'REPLACE')
+                if do_mirror:
+                    m_idx = mirror_map.get(idx)
+                    if m_idx is not None:
+                        vgroups[opp_vg_idx].add([m_idx], new_w, 'REPLACE')
 
             mesh.update()
             if do_norm and context.active_object == obj:
@@ -869,6 +1040,151 @@ class WPM_OT_set_vertex_weight(Operator):
         if self.mode == 'SET' and self.sync_brush_weight:
             set_current_brush_weight(context, max(0.0, min(1.0, self.value)))
 
+        return {'FINISHED'}
+
+
+class WPM_OT_mirror_vertex_weights(Operator):
+    """編集モード等で頂点に振ったウェイトを、反対側の対称頂点（.L ↔ .R ボーン自動変換）へ左右対称に適用します"""
+    bl_idname = "wpm.mirror_vertex_weights"
+    bl_label = "左右対称にウェイトを適用 (Mirror)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    direction: EnumProperty(
+        name="対称化の方向",
+        items=[
+            ('SELECTED', "選択頂点 → 反対側へ対称適用", "現在選択している頂点のウェイトを反対側の対称頂点（.L ↔ .R 自動変換）へミラー適用します"),
+            ('L_TO_R', "左 (.L) → 右 (.R) 全頂点対称化", "左側の全頂点のウェイトを右側へミラーコピーしてメッシュ全体を左右対称にします"),
+            ('R_TO_L', "右 (.R) → 左 (.L) 全頂点対称化", "右側の全頂点のウェイトを左側へミラーコピーしてメッシュ全体を左右対称にします"),
+        ],
+        default='SELECTED',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        obj = get_target_mesh_object(context)
+        return obj is not None and len(obj.vertex_groups) > 0
+
+    def execute(self, context):
+        obj = get_target_mesh_object(context)
+        if not obj:
+            return {'CANCELLED'}
+        mesh = obj.data
+        opp_group_map = ensure_opposite_vertex_groups(obj)
+        mirror_map, coords = build_mesh_mirror_map(obj)
+        if not mirror_map:
+            self.report({'WARNING'}, "対称な頂点が見つかりませんでした")
+            return {'CANCELLED'}
+
+        act_vg_name = obj.vertex_groups.active.name if obj.vertex_groups.active else ""
+        active_sign = get_bone_x_sign(obj, act_vg_name)
+        if active_sign == 0:
+            active_sign = 1  # デフォルトは +X (左.L) 基準
+
+        # ソース頂点の決定
+        if self.direction == 'L_TO_R':
+            left_sign = get_bone_x_sign(obj, ".L") or 1
+            source_indices = [i for i, co in enumerate(coords) if (co.x * left_sign) >= -1e-4]
+        elif self.direction == 'R_TO_L':
+            right_sign = get_bone_x_sign(obj, ".R") or -1
+            source_indices = [i for i, co in enumerate(coords) if (co.x * right_sign) >= -1e-4]
+        else:
+            if obj.mode == 'EDIT':
+                bm_tmp = bmesh.from_edit_mesh(mesh)
+                bm_tmp.verts.ensure_lookup_table()
+                sel_indices = [v.index for v in bm_tmp.verts if v.select]
+            else:
+                sel_indices = [v.index for v in mesh.vertices if v.select]
+
+            if not sel_indices or len(sel_indices) == len(coords):
+                source_indices = [i for i, co in enumerate(coords) if (co.x * active_sign) >= -1e-4]
+            else:
+                sel_set = set(sel_indices)
+                source_indices = []
+                for idx in sel_indices:
+                    m_idx = mirror_map.get(idx)
+                    # 両側とも選択されているペアはアクティブボーン側をコピー元にする
+                    if m_idx is not None and m_idx != idx and m_idx in sel_set:
+                        if (coords[idx].x * active_sign) < -1e-4:
+                            continue
+                    source_indices.append(idx)
+                if not source_indices:
+                    source_indices = sel_indices
+
+        mirrored_count = 0
+
+        if obj.mode == 'EDIT':
+            ensure_edit_mode_weight_overlay(context, True)
+            bm = bmesh.from_edit_mesh(mesh)
+            bm.verts.ensure_lookup_table()
+            deform = bm.verts.layers.deform.verify()
+
+            # 元のウェイトのスナップショットを取得してから書き込む（順序依存を防止）
+            snapshot = {
+                idx: dict(bm.verts[idx][deform].items())
+                for idx in source_indices
+            }
+
+            for v_idx in source_indices:
+                m_idx = mirror_map.get(v_idx)
+                if m_idx is None:
+                    continue
+                src_w = snapshot[v_idx]
+                if m_idx == v_idx:
+                    # 中央線上の頂点は .L と .R のウェイトを対称化
+                    dv = bm.verts[v_idx][deform]
+                    new_center = {}
+                    for k, w in src_w.items():
+                        opp_k = opp_group_map.get(k, k)
+                        if opp_k != k:
+                            if opp_k in src_w:
+                                new_center[k] = 0.5 * (w + src_w[opp_k])
+                                new_center[opp_k] = 0.5 * (w + src_w[opp_k])
+                            else:
+                                new_center[k] = w
+                                new_center[opp_k] = w
+                        else:
+                            new_center[k] = w
+                    total_c = sum(new_center.values())
+                    if total_c > 1e-6:
+                        inv_c = 1.0 / total_c
+                        for k in new_center:
+                            new_center[k] *= inv_c
+                    dv.clear()
+                    for k, w in new_center.items():
+                        if w > 1e-5:
+                            dv[k] = w
+                    mirrored_count += 1
+                else:
+                    m_dv = bm.verts[m_idx][deform]
+                    m_dv.clear()
+                    for k, w in src_w.items():
+                        if w > 1e-5:
+                            m_dv[opp_group_map.get(k, k)] = w
+                    mirrored_count += 1
+
+            bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+        else:
+            vgroups = obj.vertex_groups
+            snapshot = {
+                idx: {g.group: g.weight for g in mesh.vertices[idx].groups}
+                for idx in source_indices
+            }
+            for v_idx in source_indices:
+                m_idx = mirror_map.get(v_idx)
+                if m_idx is None or m_idx == v_idx:
+                    continue
+                src_w = snapshot[v_idx]
+                m_map = {opp_group_map.get(k, k): w for k, w in src_w.items() if w > 1e-5}
+                for vg in vgroups:
+                    g_idx = vg.index
+                    if g_idx in m_map:
+                        vg.add([m_idx], m_map[g_idx], 'REPLACE')
+                    else:
+                        vg.remove([m_idx])
+                mirrored_count += 1
+            mesh.update()
+
+        self.report({'INFO'}, f"{mirrored_count} 頂点のウェイトを左右対称にミラー適用しました")
         return {'FINISHED'}
 
 
@@ -938,6 +1254,7 @@ def _draw_scroll_blur_hud(op, context):
     x, y = op._mouse_x + 24, op._mouse_y + 24
 
     target_str = "全頂点グループ (自動正規化)" if op.affect_all_groups else "アクティブグループのみ"
+    mirror_str = "ON (.L ↔ .R 自動対称)" if op.use_mirror_x else "OFF"
 
     lines = [
         f"【マウスホイールぼかし】 確定: 左クリック/Enter | キャンセル: 右クリック/Esc",
@@ -945,6 +1262,7 @@ def _draw_scroll_blur_hud(op, context):
         f"  [Shift + ホイール] 周囲への広がり (Rings) : +{op.expand_rings} リング",
         f"  [Ctrl + ホイール] ぼかし強度 (Factor) : {op.factor:.2f}",
         f"  [A キー切替] 対象 : {target_str}",
+        f"  [X キー切替] 左右対称ミラー (X-Mirror) : {mirror_str}",
     ]
 
     blf.size(font_id, 15)
@@ -965,7 +1283,7 @@ def _draw_scroll_blur_hud(op, context):
 
 
 class WPM_OT_interactive_scroll_blur(Operator):
-    """選択した頂点からマウスホイールの上下で直感的にウェイトをぼかします（編集モード・ウェイトペイント両対応）"""
+    """選択した頂点からマウスホイールの上下で直感的にウェイトをぼかします（編集モード・ウェイトペイント両対応＆Xミラー対称対応）"""
     bl_idname = "wpm.interactive_scroll_blur"
     bl_label = "マウスホイールでウェイトぼかし (Scroll Blur)"
     bl_options = {'REGISTER', 'UNDO', 'GRAB_CURSOR', 'BLOCKING'}
@@ -993,6 +1311,10 @@ class WPM_OT_interactive_scroll_blur(Operator):
         name="全グループを対象 (自動正規化)",
         default=True,
     )
+    use_mirror_x: BoolProperty(
+        name="左右対称 (Xミラー)",
+        default=True,
+    )
 
     @classmethod
     def poll(cls, context):
@@ -1014,12 +1336,17 @@ class WPM_OT_interactive_scroll_blur(Operator):
         if settings:
             self.expand_rings = settings.blur_default_expand_rings
             self.factor = settings.blur_step_factor
+            self.use_mirror_x = settings.use_mirror_x_on_edit
 
         self.steps = 1
         self._mouse_x = event.mouse_region_x
         self._mouse_y = event.mouse_region_y
+        self._opp_group_map = ensure_opposite_vertex_groups(obj)
+        self._mirror_map, self._coords = build_mesh_mirror_map(obj)
         self._active_vg_index = obj.vertex_groups.active_index if obj.vertex_groups.active else 0
         self._num_groups = len(obj.vertex_groups)
+        act_vg_name = obj.vertex_groups.active.name if obj.vertex_groups.active else ""
+        self._active_sign = get_bone_x_sign(obj, act_vg_name) or 1
 
         if obj.mode == 'EDIT':
             ensure_edit_mode_weight_overlay(context, True)
@@ -1091,11 +1418,12 @@ class WPM_OT_interactive_scroll_blur(Operator):
 
     def _update_header_text(self, context):
         target_str = "全グループ(正規化)" if self.affect_all_groups else "アクティブのみ"
+        mirror_str = "ON" if self.use_mirror_x else "OFF"
         context.area.header_text_set(
             f"【ホイールぼかし】 [ホイール上下] 回数: {self.steps} | "
             f"[Shift+ホイール] 周囲リング拡張: +{self.expand_rings} | "
             f"[Ctrl+ホイール] 強度: {self.factor:.2f} | "
-            f"[A] 対象: {target_str} | "
+            f"[A] 対象: {target_str} | [X] 左右対称: {mirror_str} | "
             f"[左クリック/Enter] 確定 | [右クリック/Esc] キャンセル"
         )
 
@@ -1105,7 +1433,7 @@ class WPM_OT_interactive_scroll_blur(Operator):
 
         if restore_original or self.steps == 0:
             computed = {k: dict(v) for k, v in self._orig_weights.items()}
-            target_vertices = list(self._orig_weights.keys())
+            write_vertices = list(self._orig_weights.keys())
         else:
             target_vertices = [
                 v_idx for v_idx, dist in self._ring_dist.items()
@@ -1165,12 +1493,35 @@ class WPM_OT_interactive_scroll_blur(Operator):
                     current[v_idx] = nd
 
             computed = current
+            write_set = set(target_vertices)
+
+            # 左右対称ミラー (X-Mirror) の適用
+            for v_idx in target_vertices:
+                m_idx = self._mirror_map.get(v_idx)
+                if m_idx is not None and m_idx != v_idx:
+                    write_set.add(m_idx)
+
+            if self.use_mirror_x:
+                target_set = set(target_vertices)
+                opp_map = self._opp_group_map
+                for v_idx in target_vertices:
+                    m_idx = self._mirror_map.get(v_idx)
+                    if m_idx is None or m_idx == v_idx:
+                        continue
+                    if m_idx in target_set and (self._coords[v_idx].x * self._active_sign) < -1e-4:
+                        continue
+                    computed[m_idx] = {
+                        opp_map.get(g_idx, g_idx): w
+                        for g_idx, w in computed[v_idx].items()
+                    }
+
+            write_vertices = list(write_set)
 
         if obj.mode == 'EDIT':
             bm = bmesh.from_edit_mesh(mesh)
             bm.verts.ensure_lookup_table()
             deform = bm.verts.layers.deform.verify()
-            for v_idx in target_vertices:
+            for v_idx in write_vertices:
                 dv = bm.verts[v_idx][deform]
                 dv.clear()
                 for g_idx, w in computed[v_idx].items():
@@ -1178,7 +1529,7 @@ class WPM_OT_interactive_scroll_blur(Operator):
             bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
         else:
             vgroups = obj.vertex_groups
-            for v_idx in target_vertices:
+            for v_idx in write_vertices:
                 w_map = computed[v_idx]
                 for vg in vgroups:
                     g_idx = vg.index
@@ -1221,6 +1572,13 @@ class WPM_OT_interactive_scroll_blur(Operator):
 
         if event.type == 'A' and event.value == 'PRESS':
             self.affect_all_groups = not self.affect_all_groups
+            self._apply_current_blur(context)
+            self._update_header_text(context)
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'X' and event.value == 'PRESS':
+            self.use_mirror_x = not self.use_mirror_x
             self._apply_current_blur(context)
             self._update_header_text(context)
             context.area.tag_redraw()
@@ -1469,7 +1827,7 @@ class VIEW3D_MT_wpm_main_pie(Menu):
 
         _, show_contours, show_wire, show_edit_w, bone_front, bone_names, bone_axes = get_viewport_overlay_states(context, arm_obj)
 
-        # [4] 西 (Left): 選択頂点のウェイト数値一括セット・加減算
+        # [4] 西 (Left): 選択頂点のウェイト数値一括セット・加減算・左右対称ミラー
         box_left = pie.column()
         b_col = box_left.box().column(align=True)
         b_col.label(text=f"頂点ウェイト設定 [{act_vg_name}]", icon='VERTEXSEL')
@@ -1484,6 +1842,14 @@ class VIEW3D_MT_wpm_main_pie(Menu):
             op = row_delta.operator("wpm.set_vertex_weight", text=f"{delta:+g}")
             op.mode = 'ADD'
             op.value = delta
+
+        settings = getattr(context.scene, "wpm_settings", None)
+        if settings:
+            row_opt = b_col.row(align=True)
+            row_opt.prop(settings, "use_mirror_x_on_edit", text="X対称自動反映", toggle=True, icon='MOD_MIRROR')
+            row_opt.prop(settings, "auto_normalize_on_edit", text="自動正規化", toggle=True)
+        row_mir = b_col.row(align=True)
+        row_mir.operator("wpm.mirror_vertex_weights", text="選択頂点を左右対称に適用 (Mirror)", icon='MOD_MIRROR').direction = 'SELECTED'
 
         # [6] 東 (Right): ブラシ切替 (Mix / Add / Sub / Blur / Average / Smear / Multiply / Lighten)
         box_right = pie.column()
@@ -1806,10 +2172,10 @@ class VIEW3D_PT_wpm_sidebar(Panel):
             row_sb_prop.prop(settings, "blur_step_factor", text="強度")
 
         # --------------------------------------------------------------------
-        # 5. 選択頂点ウェイト数値設定
+        # 5. 選択頂点ウェイト数値設定 & 左右対称(Xミラー)
         # --------------------------------------------------------------------
         box_v = layout.box()
-        box_v.label(text="選択頂点ウェイト数値設定", icon='VERTEXSEL')
+        box_v.label(text="選択頂点ウェイト設定 & 左右対称", icon='VERTEXSEL')
         col_v = box_v.column(align=True)
         row_vp = col_v.row(align=True)
         for v in (0.0, 0.1, 0.25, 0.5, 0.75, 1.0):
@@ -1822,7 +2188,31 @@ class VIEW3D_PT_wpm_sidebar(Panel):
             op.mode = 'ADD'
             op.value = d
         if settings:
-            col_v.prop(settings, "auto_normalize_on_edit")
+            col_v.separator()
+            row_vopt = col_v.row(align=True)
+            row_vopt.prop(settings, "use_mirror_x_on_edit", text="X対称自動反映 (.L↔.R)", toggle=True, icon='MOD_MIRROR')
+            row_vopt.prop(settings, "auto_normalize_on_edit", text="自動正規化", toggle=True)
+
+        col_v.separator()
+        row_msel = col_v.row(align=True)
+        row_msel.scale_y = 1.25
+        row_msel.operator(
+            "wpm.mirror_vertex_weights",
+            text="選択頂点を左右対称に適用 (Mirror)",
+            icon='MOD_MIRROR',
+        ).direction = 'SELECTED'
+
+        row_mall = col_v.row(align=True)
+        row_mall.operator(
+            "wpm.mirror_vertex_weights",
+            text="全頂点: 左(.L) → 右(.R)",
+            icon='ARROW_LEFTRIGHT',
+        ).direction = 'L_TO_R'
+        row_mall.operator(
+            "wpm.mirror_vertex_weights",
+            text="全頂点: 右(.R) → 左(.L)",
+            icon='ARROW_LEFTRIGHT',
+        ).direction = 'R_TO_L'
 
         # --------------------------------------------------------------------
         # 6. ブラシ切替 & パラメータ
@@ -1890,6 +2280,7 @@ classes = (
     WPM_OT_switch_opposite_bone,
     VIEW3D_MT_wpm_bone_select_menu,
     WPM_OT_set_vertex_weight,
+    WPM_OT_mirror_vertex_weights,
     WPM_OT_quick_clean_and_normalize,
     WPM_OT_interactive_scroll_blur,
     WPM_OT_select_brush_preset,
